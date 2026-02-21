@@ -1,0 +1,146 @@
+# GitHub Actions Workflow for Application Deployment
+name: Deploy Application
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  BACKEND_IMAGE: crud-backend
+  FRONTEND_IMAGE: crud-frontend
+  RESOURCE_GROUP: rg-aks-crud-app
+  CLUSTER_NAME: aks-crud-cluster
+  NAMESPACE: crud-app
+
+jobs:
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Login to Azure Container Registry
+      run: |
+        az acr login --name ${{ secrets.ACR_NAME }}
+
+    - name: Build and Push Backend Image
+      run: |
+        docker build -t ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }} \
+                     -t ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest \
+                     ./backend
+        docker push ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+
+    - name: Build and Push Frontend Image
+      run: |
+        docker build -t ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }} \
+                     -t ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest \
+                     ./frontend
+        docker push ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+        docker push ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+
+  deploy-to-aks:
+    name: Deploy to AKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get AKS Credentials
+      run: |
+        az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }}
+
+    - name: Replace tokens in manifests
+      run: |
+        # Replace image tags in Kubernetes manifests
+        sed -i "s|#{ACR_LOGIN_SERVER}#|${{ secrets.ACR_LOGIN_SERVER }}|g" k8s/*.yaml
+        sed -i "s|#{IMAGE_TAG}#|${{ github.sha }}|g" k8s/*.yaml
+        sed -i "s|#{DB_ADMIN_USERNAME}#|${{ secrets.DB_ADMIN_USERNAME }}|g" k8s/*.yaml
+        sed -i "s|#{DB_ADMIN_PASSWORD}#|${{ secrets.DB_ADMIN_PASSWORD }}|g" k8s/*.yaml
+        sed -i "s|#{POSTGRES_FQDN}#|${{ secrets.POSTGRES_FQDN }}|g" k8s/*.yaml
+        sed -i "s|#{DB_NAME}#|${{ secrets.DB_NAME }}|g" k8s/*.yaml
+
+    - name: Deploy to AKS
+      run: |
+        # Create namespace
+        kubectl apply -f k8s/namespace.yaml
+        
+        # Deploy secrets
+        kubectl apply -f k8s/secrets.yaml
+        
+        # Deploy backend
+        kubectl apply -f k8s/backend-deployment.yaml
+        
+        # Deploy frontend
+        kubectl apply -f k8s/frontend-deployment.yaml
+        
+        # Wait for deployments
+        echo "⏳ Waiting for backend deployment..."
+        kubectl rollout status deployment/backend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
+        
+        echo "⏳ Waiting for frontend deployment..."
+        kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=600s
+
+    - name: Debug Frontend Issues
+      if: failure()
+      run: |
+        echo "🔍 Debugging frontend deployment issues..."
+        echo ""
+        echo "=== Pod Status ==="
+        kubectl get pods -n ${{ env.NAMESPACE }} -l app=frontend -o wide
+        echo ""
+        echo "=== Pod Logs ==="
+        kubectl get pods -n ${{ env.NAMESPACE }} -l app=frontend -o name | while read pod; do
+          echo "--- Logs for $pod ---"
+          kubectl logs -n ${{ env.NAMESPACE }} $pod --tail=100 || echo "No logs available"
+          echo "--- Previous logs for $pod ---"
+          kubectl logs -n ${{ env.NAMESPACE }} $pod --previous --tail=100 || echo "No previous logs available"
+          echo ""
+        done
+        echo ""
+        echo "=== Pod Events ==="
+        kubectl get events -n ${{ env.NAMESPACE }} --sort-by='.lastTimestamp' | grep frontend || echo "No events found"
+        echo ""
+        echo "=== Pod Describe ==="
+        kubectl describe pods -n ${{ env.NAMESPACE }} -l app=frontend
+
+    - name: Get Service Information
+      run: |
+        echo "## 🚀 Application Deployed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌐 Service Information:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get services -n ${{ env.NAMESPACE }}
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📋 Pods Status:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get pods -n ${{ env.NAMESPACE }}
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 Access Your Application:" >> $GITHUB_STEP_SUMMARY
+        echo "Run this command to get the external IP:" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "kubectl get service frontend-service -n ${{ env.NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        # Also output to console
+        kubectl get services -n ${{ env.NAMESPACE }}
+        kubectl get pods -n ${{ env.NAMESPACE }}

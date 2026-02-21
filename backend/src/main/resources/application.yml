@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: crud-api
+  
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/crudapp}
+    username: ${DATABASE_USERNAME:dbadmin}
+    password: ${DATABASE_PASSWORD:P@ssw0rd123!}
+    driver-class-name: org.postgresql.Driver
+  
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+  
+  # Actuator configuration
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,info,metrics
+    endpoint:
+      health:
+        show-details: always
+
+server:
+  port: ${SERVER_PORT:8080}
+
+# Swagger/OpenAPI configuration
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+
+# Logging configuration
+logging:
+  level:
+    com.example.crudapi: INFO
+    org.springframework.web: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"

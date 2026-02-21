@@ -1,0 +1,238 @@
+# GitHub Actions Workflow for Infrastructure Destruction
+name: Destroy Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: 'Type "DESTROY" to confirm complete infrastructure destruction'
+        required: true
+        type: string
+      destroy_method:
+        description: 'Destruction method'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+        - terraform
+        - azure-cli
+        - both
+
+env:
+  TERRAFORM_VERSION: '1.5.0'
+  WORKING_DIRECTORY: './infrastructure'
+  BACKEND_RESOURCE_GROUP_NAME: 'rg-terraform-state'
+  BACKEND_STORAGE_ACCOUNT_NAME: 'tfstateakscrud${{ github.run_number }}'
+  BACKEND_CONTAINER_NAME: 'tfstate'
+  BACKEND_KEY: 'aks-crud-app.tfstate'
+  MAIN_RESOURCE_GROUP: 'rg-aks-crud-app'
+
+jobs:
+  validate-destroy:
+    name: Validate Destruction Request
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Validate Confirmation
+      run: |
+        if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+          echo "❌ Destruction cancelled. You must type 'DESTROY' to confirm."
+          exit 1
+        fi
+        echo "✅ Destruction confirmed. Proceeding with infrastructure cleanup..."
+        echo "🚨 WARNING: This will delete ALL resources and resource groups!"
+
+  terraform-destroy:
+    name: Terraform Destroy
+    needs: validate-destroy
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy_method == 'terraform' || github.event.inputs.destroy_method == 'both' }}
+    continue-on-error: true
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Terraform Init
+      working-directory: ${{ env.WORKING_DIRECTORY }}
+      continue-on-error: true
+      env:
+        ARM_CLIENT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+        ARM_CLIENT_SECRET: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+        ARM_SUBSCRIPTION_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+        ARM_TENANT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}
+      run: |
+        terraform init \
+          -backend-config="resource_group_name=${{ env.BACKEND_RESOURCE_GROUP_NAME }}" \
+          -backend-config="storage_account_name=${{ env.BACKEND_STORAGE_ACCOUNT_NAME }}" \
+          -backend-config="container_name=${{ env.BACKEND_CONTAINER_NAME }}" \
+          -backend-config="key=${{ env.BACKEND_KEY }}"
+
+    - name: Terraform Destroy
+      working-directory: ${{ env.WORKING_DIRECTORY }}
+      continue-on-error: true
+      env:
+        ARM_CLIENT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+        ARM_CLIENT_SECRET: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+        ARM_SUBSCRIPTION_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).subscriptionId }}
+        ARM_TENANT_ID: ${{ fromJson(secrets.AZURE_CREDENTIALS).tenantId }}
+      run: terraform destroy -auto-approve
+
+  azure-cli-destroy:
+    name: Azure CLI Destroy (Fallback)
+    needs: [validate-destroy, terraform-destroy]
+    runs-on: ubuntu-latest
+    if: ${{ always() && (github.event.inputs.destroy_method == 'azure-cli' || github.event.inputs.destroy_method == 'both') }}
+    
+    steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: List All Resource Groups
+      run: |
+        echo "🔍 Listing all resource groups before destruction..."
+        az group list --output table
+
+    - name: Destroy AKS Node Resource Groups
+      continue-on-error: true
+      run: |
+        echo "🔍 Looking for AKS node resource groups..."
+        
+        # Find AKS node resource groups (they start with MC_)
+        NODE_RGS=$(az group list --query "[?starts_with(name, 'MC_${{ env.MAIN_RESOURCE_GROUP }}_')].name" -o tsv)
+        
+        if [ -n "$NODE_RGS" ]; then
+          echo "🔥 Found AKS node resource groups to delete:"
+          echo "$NODE_RGS"
+          
+          for RG in $NODE_RGS; do
+            echo "🔥 Deleting node resource group: $RG"
+            az group delete --name "$RG" --yes --no-wait
+          done
+        else
+          echo "✅ No AKS node resource groups found"
+        fi
+
+    - name: Destroy Main Resource Group
+      continue-on-error: true
+      run: |
+        echo "🔥 Destroying main resource group: ${{ env.MAIN_RESOURCE_GROUP }}"
+        
+        if az group show --name "${{ env.MAIN_RESOURCE_GROUP }}" &>/dev/null; then
+          echo "🔥 Deleting main resource group: ${{ env.MAIN_RESOURCE_GROUP }}"
+          az group delete --name "${{ env.MAIN_RESOURCE_GROUP }}" --yes --no-wait
+        else
+          echo "✅ Main resource group ${{ env.MAIN_RESOURCE_GROUP }} not found (already deleted)"
+        fi
+
+    - name: Destroy Terraform State Resource Group
+      continue-on-error: true
+      run: |
+        echo "🔥 Destroying Terraform state resource group: ${{ env.BACKEND_RESOURCE_GROUP_NAME }}"
+        
+        if az group show --name "${{ env.BACKEND_RESOURCE_GROUP_NAME }}" &>/dev/null; then
+          echo "🔥 Deleting Terraform state resource group: ${{ env.BACKEND_RESOURCE_GROUP_NAME }}"
+          az group delete --name "${{ env.BACKEND_RESOURCE_GROUP_NAME }}" --yes --no-wait
+        else
+          echo "✅ Terraform state resource group ${{ env.BACKEND_RESOURCE_GROUP_NAME }} not found (already deleted)"
+        fi
+
+    - name: Cleanup NetworkWatcher Resource Groups
+      continue-on-error: true
+      run: |
+        echo "🔍 Checking for NetworkWatcher resource groups..."
+        
+        # Find NetworkWatcher resource groups
+        NETWATCHER_RGS=$(az group list --query "[?starts_with(name, 'NetworkWatcherRG')].name" -o tsv)
+        
+        if [ -n "$NETWATCHER_RGS" ]; then
+          for RG in $NETWATCHER_RGS; do
+            echo "📋 Checking NetworkWatcher RG: $RG"
+            
+            # Check if it only contains Network Watcher resources
+            RESOURCES=$(az resource list --resource-group "$RG" --query "length([?type!='Microsoft.Network/networkWatchers'])" -o tsv)
+            
+            if [ "$RESOURCES" = "0" ]; then
+              echo "🔥 NetworkWatcher RG $RG only contains Network Watcher, safe to delete"
+              az group delete --name "$RG" --yes --no-wait
+            else
+              echo "⚠️ NetworkWatcher RG $RG contains other resources, keeping it"
+            fi
+          done
+        else
+          echo "✅ No NetworkWatcher resource groups found"
+        fi
+
+  verify-destruction:
+    name: Verify Complete Destruction
+    needs: [azure-cli-destroy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Wait for Deletions to Complete
+      run: |
+        echo "⏳ Waiting 2 minutes for resource group deletions to process..."
+        sleep 120
+
+    - name: Verify Resource Groups Deleted
+      run: |
+        echo "🔍 Verifying all project resource groups are deleted..."
+        
+        # Check for remaining project resource groups
+        REMAINING_RGS=$(az group list --query "[?starts_with(name, 'rg-aks-crud-app') || starts_with(name, 'MC_rg-aks-crud-app') || starts_with(name, 'rg-terraform-state')].name" -o tsv)
+        
+        if [ -z "$REMAINING_RGS" ]; then
+          echo "🎯 SUCCESS: All project resource groups have been deleted!"
+          echo "💰 No more costs will be incurred from this infrastructure"
+        else
+          echo "⚠️ WARNING: Some resource groups may still be deleting:"
+          echo "$REMAINING_RGS"
+          echo ""
+          echo "💡 These may still be in the deletion process. Check Azure Portal in a few minutes."
+        fi
+        
+        echo ""
+        echo "📋 Current resource groups in subscription:"
+        az group list --output table
+
+    - name: Final Cleanup Report
+      run: |
+        echo "## 🏁 DESTRUCTION COMPLETED" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Attempted to delete:" >> $GITHUB_STEP_SUMMARY
+        echo "- Main resource group: \`${{ env.MAIN_RESOURCE_GROUP }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- AKS node resource groups (MC_*)" >> $GITHUB_STEP_SUMMARY
+        echo "- Terraform state resource group: \`${{ env.BACKEND_RESOURCE_GROUP_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- NetworkWatcher resource groups (if safe)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 💰 Cost Impact:" >> $GITHUB_STEP_SUMMARY
+        echo "- AKS cluster: **STOPPED**" >> $GITHUB_STEP_SUMMARY
+        echo "- PostgreSQL database: **DELETED**" >> $GITHUB_STEP_SUMMARY
+        echo "- Load balancers: **DELETED**" >> $GITHUB_STEP_SUMMARY
+        echo "- Storage accounts: **DELETED**" >> $GITHUB_STEP_SUMMARY
+        echo "- Container registry: **DELETED**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔄 To redeploy:" >> $GITHUB_STEP_SUMMARY
+        echo "1. Run **Infrastructure Deployment** workflow" >> $GITHUB_STEP_SUMMARY
+        echo "2. Update repository secrets with new outputs" >> $GITHUB_STEP_SUMMARY
+        echo "3. Run **Deploy Application** workflow" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "⚠️ **Note**: Some resources may take up to 10 minutes to fully delete"
