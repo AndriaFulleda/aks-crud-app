@@ -82,6 +82,7 @@ az role assignment create \
 
 # Verificar que tiene ambos roles
 az role assignment list --assignee $CLIENT_ID --output table
+az role assignment list --assignee afullida@magalykixedu.onmicrosoft.com --all -o table
 ```
 
 **Deberías ver dos roles**:
